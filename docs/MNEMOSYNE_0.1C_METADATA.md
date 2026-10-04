@@ -108,3 +108,17 @@ Example output:
 4. No metadata value can grant execution authority.
 
 The round-trip test is the next implementation slice.
+
+
+## Live round-trip gate
+
+A dedicated disposable-bank test is available:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\test-phoenix-metadata-roundtrip.ps1
+```
+
+It creates Phoenix metadata through the validated schema, Retains a unique repair
+memory through the normal Hindsight-compatible API, Recalls the canary, verifies
+the `pv_` metadata and provenance values survived, confirms
+`pv_authority=context_only`, and deletes the disposable bank.
