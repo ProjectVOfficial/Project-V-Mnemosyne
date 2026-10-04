@@ -33,6 +33,9 @@ $env:HINDSIGHT_API_LLM_MODEL = $Model
 $env:HINDSIGHT_API_LLM_BASE_URL = $OllamaUrl
 $env:HINDSIGHT_API_HOST = "127.0.0.1"
 $env:HINDSIGHT_API_PORT = "$Port"
+$env:HINDSIGHT_API_HTTP_EXTENSION = "hindsight_api.extensions.builtin.mnemosyne_identity:MnemosyneIdentityExtension"
+$env:HINDSIGHT_API_HTTP_MODE = "development"
+$env:PROJECT_V_MNEMOSYNE_MODE = "development"
 
 Write-Host ""
 Write-Host "Project V // Mnemosyne 0.1 candidate" -ForegroundColor Cyan
