@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from hindsight_api import MemoryEngine
 
 
-MNEMOSYNE_VERSION = "0.1b"
+MNEMOSYNE_VERSION = "0.2"
 MNEMOSYNE_PRODUCT = "Project V // Mnemosyne"
 MNEMOSYNE_ROLE = "Phoenix Memory Core"
 
@@ -36,7 +36,13 @@ class MnemosyneIdentityExtension(HttpExtension):
                 "retain": True,
                 "recall": True,
                 "reflect": True,
-                "phoenix_contract": "0.1",
+                "phoenix_contract": "0.2",
+            },
+            "phoenix_metadata": {
+                "schema_version": "1",
+                "prefix": "pv_",
+                "authority": "context_only",
+                "retain_round_trip_validated": True,
             },
             "runtime": {
                 "mode": self.config.get("mode", os.getenv("PROJECT_V_MNEMOSYNE_MODE", "development")),
