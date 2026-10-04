@@ -7,9 +7,23 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+$uvOnPath = Get-Command uv -ErrorAction SilentlyContinue
+$usePythonModule = $false
+
+if (-not $uvOnPath) {
+  try {
+    py -m uv --version *> $null
+    if ($LASTEXITCODE -eq 0) { $usePythonModule = $true }
+  } catch {
+    $usePythonModule = $false
+  }
+}
+
+if (-not $uvOnPath -and -not $usePythonModule) {
   Write-Host "uv was not found." -ForegroundColor Red
-  Write-Host "Install it with: py -m pip install --user uv"
+  Write-Host "Install it with:"
+  Write-Host "  py -m pip install --user uv" -ForegroundColor Yellow
+  Write-Host "Then run this launcher again."
   exit 1
 }
 
@@ -30,4 +44,10 @@ Write-Host ""
 Write-Host "This is the isolated candidate runtime. Production Phoenix should remain on stock Hindsight." -ForegroundColor Yellow
 Write-Host ""
 
-uv run --package hindsight-api hindsight-api --host 127.0.0.1 --port $Port
+if ($uvOnPath) {
+  & uv run --package hindsight-api hindsight-api --host 127.0.0.1 --port $Port
+} else {
+  & py -m uv run --package hindsight-api hindsight-api --host 127.0.0.1 --port $Port
+}
+
+exit $LASTEXITCODE
