@@ -112,6 +112,27 @@ def _contains_token(payload: Any, token: str) -> bool:
     return needle in json.dumps(payload, ensure_ascii=False).lower()
 
 
+def _version_tuple(value: str) -> tuple[int, int, int] | None:
+    try:
+        parts = [int(part) for part in str(value).strip().split(".")]
+    except ValueError:
+        return None
+    if len(parts) < 2:
+        return None
+    return (parts[0], parts[1], parts[2] if len(parts) > 2 else 0)
+
+
+def _api_version_compatible(stock_version: str, candidate_version: str) -> bool:
+    stock = _version_tuple(stock_version)
+    candidate = _version_tuple(candidate_version)
+    if stock is None or candidate is None:
+        return False
+    # Patch releases within the same API family are compatible when the
+    # candidate is not older than the stock runtime. Functional contract checks
+    # below remain the primary compatibility gate.
+    return candidate[:2] == stock[:2] and candidate >= stock
+
+
 def run_target(
     label: str,
     base_url: str,
@@ -328,7 +349,7 @@ def main() -> int:
         parity = {
             "stock_pass": stock.hard_pass,
             "candidate_pass": candidate.hard_pass,
-            "api_version_equal": stock.api_version == candidate.api_version,
+            "api_version_compatible": _api_version_compatible(stock.api_version, candidate.api_version),
             "feature_keys_equal": set((stock.features or {}).keys()) == set((candidate.features or {}).keys()),
         }
         print("\n== Side-by-side parity ==")
