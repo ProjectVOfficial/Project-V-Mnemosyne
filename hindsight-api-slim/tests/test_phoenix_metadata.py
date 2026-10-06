@@ -1,11 +1,14 @@
 from hindsight_api.phoenix_metadata import (
     MAX_CORTEX_EVIDENCE_IDS,
+    MAX_TOOL_LEARNING_EVIDENCE_IDS,
     PhoenixCortexRecord,
     PhoenixCortexRecordKind,
     PhoenixCortexRecordState,
     PhoenixMemoryClass,
     PhoenixMemoryMetadata,
     PhoenixOutcome,
+    PhoenixToolLearningKind,
+    PhoenixToolLearningRecord,
     PhoenixProvenance,
     PhoenixVerification,
     is_phoenix_metadata,
@@ -207,3 +210,163 @@ def test_cortex_evidence_id_count_is_bounded() -> None:
         pass
     else:
         raise AssertionError("Cortex evidence IDs must be bounded")
+
+
+
+def test_tool_learning_record_serializes_to_hindsight_string_map() -> None:
+    item = PhoenixMemoryMetadata(
+        source="react",
+        project="Phoenix",
+        tool="terminal",
+        memory_class=PhoenixMemoryClass.REPAIR_ATTEMPT,
+        confidence=0.94,
+        outcome=PhoenixOutcome.SUCCESS,
+        verification=PhoenixVerification.TEST_VERIFIED,
+        tool_learning=PhoenixToolLearningRecord(
+            record_kind=PhoenixToolLearningKind.REPAIR_ATTEMPT,
+            record_id="repair-42",
+            tool_name="terminal",
+            operation="repair TypeScript verification failure",
+            attempt=2,
+            parent_id="task-42",
+            previous_attempt_id="repair-41",
+            failure_signature="TS2322 assignment mismatch",
+            error_class="TypeScriptDiagnostic",
+            error_code="TS2322",
+            repair_summary="Corrected the incompatible assignment and reran typecheck.",
+            evidence_ids=["typecheck-1", "typecheck-1", "typecheck-2"],
+            observed_at="2026-10-06T04:45:00Z",
+        ),
+    )
+
+    metadata = item.to_hindsight_metadata()
+
+    assert metadata["pv_memory_class"] == "repair_attempt"
+    assert metadata["pv_tool_learning_schema_version"] == "1"
+    assert metadata["pv_tool_learning_record_kind"] == "repair_attempt"
+    assert metadata["pv_tool_learning_record_id"] == "repair-42"
+    assert metadata["pv_tool_learning_tool_name"] == "terminal"
+    assert metadata["pv_tool_learning_attempt"] == "2"
+    assert metadata["pv_tool_learning_previous_attempt_id"] == "repair-41"
+    assert metadata["pv_tool_learning_error_code"] == "TS2322"
+    assert metadata["pv_tool_learning_evidence_ids"] == '["typecheck-1","typecheck-2"]'
+    assert metadata["pv_authority"] == "context_only"
+    assert all(isinstance(value, str) for value in metadata.values())
+
+
+def test_tool_learning_round_trip_preserves_semantics() -> None:
+    original = PhoenixMemoryMetadata(
+        source="tool",
+        workspace="D:/PROJECTS/Phoenix-Desktop",
+        project="Phoenix",
+        tool="workspace.command",
+        memory_class=PhoenixMemoryClass.SUCCESS_PATTERN,
+        confidence=0.96,
+        outcome=PhoenixOutcome.SUCCESS,
+        verification=PhoenixVerification.COMMAND_VERIFIED,
+        tool_learning=PhoenixToolLearningRecord(
+            record_kind=PhoenixToolLearningKind.SUCCESS_PATTERN,
+            record_id="success-pattern-7",
+            tool_name="workspace.command",
+            operation="run bounded verification after repair",
+            attempt=3,
+            parent_id="repair-chain-7",
+            previous_attempt_id="repair-attempt-2",
+            success_pattern="After the repair, rerun the narrow verification gate before broader regression.",
+            evidence_ids=["gate-pass-7"],
+            observed_at="2026-10-06T04:50:00Z",
+        ),
+        provenance=PhoenixProvenance(
+            source_type="tool_outcome",
+            verification_command="npm run typecheck",
+            verification_result="PASS",
+            tool_output_hash="ABCDEF",
+        ),
+    )
+
+    parsed = parse_phoenix_metadata(original.to_hindsight_metadata())
+
+    assert parsed is not None
+    assert parsed.memory_class == PhoenixMemoryClass.SUCCESS_PATTERN
+    assert parsed.authority == "context_only"
+    assert parsed.tool_learning is not None
+    assert parsed.tool_learning.record_kind == PhoenixToolLearningKind.SUCCESS_PATTERN
+    assert parsed.tool_learning.record_id == "success-pattern-7"
+    assert parsed.tool_learning.attempt == 3
+    assert parsed.tool_learning.previous_attempt_id == "repair-attempt-2"
+    assert parsed.tool_learning.evidence_ids == ["gate-pass-7"]
+    assert parsed.provenance is not None
+    assert parsed.provenance.tool_output_hash == "abcdef"
+
+
+def test_tool_learning_kind_requires_matching_memory_class() -> None:
+    try:
+        PhoenixMemoryMetadata(
+            memory_class=PhoenixMemoryClass.TOOL_RESULT,
+            tool_learning=PhoenixToolLearningRecord(
+                record_kind=PhoenixToolLearningKind.FAILURE,
+                record_id="failure-1",
+            ),
+        )
+    except Exception:
+        pass
+    else:
+        raise AssertionError("Tool-learning record kind must map to its Phoenix memory class")
+
+
+def test_tool_learning_evidence_id_count_is_bounded() -> None:
+    too_many = [f"ev-{index}" for index in range(MAX_TOOL_LEARNING_EVIDENCE_IDS + 1)]
+    try:
+        PhoenixToolLearningRecord(
+            record_kind=PhoenixToolLearningKind.TOOL_OUTCOME,
+            record_id="tool-1",
+            evidence_ids=too_many,
+        )
+    except Exception:
+        pass
+    else:
+        raise AssertionError("Tool-learning evidence IDs must be bounded")
+
+
+def test_malformed_tool_learning_metadata_fails_soft_without_breaking_base_memory() -> None:
+    metadata = PhoenixMemoryMetadata(
+        source="manual",
+        project="Phoenix",
+        memory_class=PhoenixMemoryClass.PROJECT_FACT,
+        confidence=0.9,
+    ).to_hindsight_metadata()
+    metadata.update(
+        {
+            "pv_tool_learning_schema_version": "1",
+            "pv_tool_learning_record_kind": "future_unknown_kind",
+            "pv_tool_learning_record_id": "bad-tool-record",
+            "pv_tool_learning_evidence_ids": "{not-json",
+        }
+    )
+
+    parsed = parse_phoenix_metadata(metadata)
+
+    assert parsed is not None
+    assert parsed.memory_class == PhoenixMemoryClass.PROJECT_FACT
+    assert parsed.tool_learning is None
+    assert parsed.project == "Phoenix"
+    assert parsed.authority == "context_only"
+
+
+def test_tool_learning_and_cortex_envelopes_cannot_coexist_on_write() -> None:
+    try:
+        PhoenixMemoryMetadata(
+            memory_class=PhoenixMemoryClass.CORTEX_EVIDENCE,
+            cortex=PhoenixCortexRecord(
+                record_kind=PhoenixCortexRecordKind.DECISION,
+                record_id="decision-native-1",
+            ),
+            tool_learning=PhoenixToolLearningRecord(
+                record_kind=PhoenixToolLearningKind.TOOL_OUTCOME,
+                record_id="tool-native-1",
+            ),
+        )
+    except Exception:
+        pass
+    else:
+        raise AssertionError("Cortex and tool-learning native envelopes must be mutually exclusive")
