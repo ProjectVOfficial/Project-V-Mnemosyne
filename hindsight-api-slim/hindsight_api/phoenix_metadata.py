@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 PHOENIX_METADATA_SCHEMA_VERSION = "1"
 PHOENIX_METADATA_PREFIX = "pv_"
 PHOENIX_CORTEX_SCHEMA_VERSION = "1"
+PHOENIX_TOOL_LEARNING_SCHEMA_VERSION = "1"
 
 MAX_CORTEX_RECORD_ID_LENGTH = 256
 MAX_CORTEX_TOPIC_LENGTH = 512
@@ -26,6 +27,17 @@ MAX_CORTEX_STATE_TEXT_LENGTH = 64
 MAX_CORTEX_SOURCE_KIND_LENGTH = 128
 MAX_CORTEX_OBSERVED_AT_LENGTH = 128
 MAX_CORTEX_EVIDENCE_IDS = 32
+
+MAX_TOOL_LEARNING_RECORD_ID_LENGTH = 256
+MAX_TOOL_LEARNING_TOOL_NAME_LENGTH = 128
+MAX_TOOL_LEARNING_OPERATION_LENGTH = 512
+MAX_TOOL_LEARNING_ERROR_CLASS_LENGTH = 128
+MAX_TOOL_LEARNING_ERROR_CODE_LENGTH = 128
+MAX_TOOL_LEARNING_FAILURE_SIGNATURE_LENGTH = 512
+MAX_TOOL_LEARNING_REPAIR_SUMMARY_LENGTH = 1024
+MAX_TOOL_LEARNING_SUCCESS_PATTERN_LENGTH = 1024
+MAX_TOOL_LEARNING_OBSERVED_AT_LENGTH = 128
+MAX_TOOL_LEARNING_EVIDENCE_IDS = 32
 
 
 class PhoenixMemoryClass(StrEnum):
@@ -89,6 +101,21 @@ class PhoenixCortexRecordState(StrEnum):
     SUPPORTED = "supported"
     UNSUPPORTED = "unsupported"
     UNKNOWN = "unknown"
+
+
+class PhoenixToolLearningKind(StrEnum):
+    TOOL_OUTCOME = "tool_outcome"
+    REPAIR_ATTEMPT = "repair_attempt"
+    FAILURE = "failure"
+    SUCCESS_PATTERN = "success_pattern"
+
+
+TOOL_LEARNING_MEMORY_CLASS: dict[PhoenixToolLearningKind, PhoenixMemoryClass] = {
+    PhoenixToolLearningKind.TOOL_OUTCOME: PhoenixMemoryClass.TOOL_RESULT,
+    PhoenixToolLearningKind.REPAIR_ATTEMPT: PhoenixMemoryClass.REPAIR_ATTEMPT,
+    PhoenixToolLearningKind.FAILURE: PhoenixMemoryClass.FAILURE,
+    PhoenixToolLearningKind.SUCCESS_PATTERN: PhoenixMemoryClass.SUCCESS_PATTERN,
+}
 
 
 class PhoenixProvenance(BaseModel):
@@ -170,6 +197,85 @@ class PhoenixCortexRecord(BaseModel):
         return result
 
 
+class PhoenixToolLearningRecord(BaseModel):
+    """Bounded tool outcome / repair-learning semantics for Phoenix memory."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1"] = PHOENIX_TOOL_LEARNING_SCHEMA_VERSION
+    record_kind: PhoenixToolLearningKind
+    record_id: str = Field(min_length=1, max_length=MAX_TOOL_LEARNING_RECORD_ID_LENGTH)
+    tool_name: str | None = Field(default=None, max_length=MAX_TOOL_LEARNING_TOOL_NAME_LENGTH)
+    operation: str | None = Field(default=None, max_length=MAX_TOOL_LEARNING_OPERATION_LENGTH)
+    attempt: int = Field(default=1, ge=1)
+    parent_id: str | None = Field(default=None, max_length=MAX_TOOL_LEARNING_RECORD_ID_LENGTH)
+    previous_attempt_id: str | None = Field(
+        default=None, max_length=MAX_TOOL_LEARNING_RECORD_ID_LENGTH
+    )
+    failure_signature: str | None = Field(
+        default=None, max_length=MAX_TOOL_LEARNING_FAILURE_SIGNATURE_LENGTH
+    )
+    error_class: str | None = Field(default=None, max_length=MAX_TOOL_LEARNING_ERROR_CLASS_LENGTH)
+    error_code: str | None = Field(default=None, max_length=MAX_TOOL_LEARNING_ERROR_CODE_LENGTH)
+    repair_summary: str | None = Field(
+        default=None, max_length=MAX_TOOL_LEARNING_REPAIR_SUMMARY_LENGTH
+    )
+    success_pattern: str | None = Field(
+        default=None, max_length=MAX_TOOL_LEARNING_SUCCESS_PATTERN_LENGTH
+    )
+    evidence_ids: list[str] = Field(default_factory=list, max_length=MAX_TOOL_LEARNING_EVIDENCE_IDS)
+    observed_at: str | None = Field(default=None, max_length=MAX_TOOL_LEARNING_OBSERVED_AT_LENGTH)
+
+    @field_validator("record_id")
+    @classmethod
+    def normalize_record_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Tool-learning record_id must not be empty")
+        return value
+
+    @field_validator(
+        "tool_name",
+        "operation",
+        "parent_id",
+        "previous_attempt_id",
+        "failure_signature",
+        "error_class",
+        "error_code",
+        "repair_summary",
+        "success_pattern",
+        "observed_at",
+    )
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def normalize_evidence_ids(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for raw in value:
+            item = str(raw).strip()
+            if not item:
+                continue
+            if len(item) > MAX_TOOL_LEARNING_RECORD_ID_LENGTH:
+                raise ValueError(
+                    f"Tool-learning evidence id exceeds {MAX_TOOL_LEARNING_RECORD_ID_LENGTH} characters"
+                )
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        if len(result) > MAX_TOOL_LEARNING_EVIDENCE_IDS:
+            raise ValueError(
+                f"Tool-learning evidence_ids exceeds {MAX_TOOL_LEARNING_EVIDENCE_IDS} entries"
+            )
+        return result
+
+
 class PhoenixMemoryMetadata(BaseModel):
     """Phoenix-native semantics carried through Hindsight-compatible metadata."""
 
@@ -196,6 +302,7 @@ class PhoenixMemoryMetadata(BaseModel):
     related_process: str | None = None
     cortex_topic: str | None = None
     cortex: PhoenixCortexRecord | None = None
+    tool_learning: PhoenixToolLearningRecord | None = None
     provenance: PhoenixProvenance | None = None
 
     @field_validator(
@@ -228,9 +335,18 @@ class PhoenixMemoryMetadata(BaseModel):
         return result
 
     @model_validator(mode="after")
-    def validate_cortex_memory_class(self) -> "PhoenixMemoryMetadata":
+    def validate_native_memory_classes(self) -> "PhoenixMemoryMetadata":
+        if self.cortex is not None and self.tool_learning is not None:
+            raise ValueError("Memory cannot carry Cortex and tool-learning native envelopes together")
         if self.cortex is not None and self.memory_class != PhoenixMemoryClass.CORTEX_EVIDENCE:
             raise ValueError("Cortex-native records must use memory_class=cortex_evidence")
+        if self.tool_learning is not None:
+            expected = TOOL_LEARNING_MEMORY_CLASS[self.tool_learning.record_kind]
+            if self.memory_class != expected:
+                raise ValueError(
+                    f"Tool-learning kind {self.tool_learning.record_kind.value} "
+                    f"must use memory_class={expected.value}"
+                )
         return self
 
     def to_hindsight_metadata(self) -> dict[str, str]:
@@ -239,6 +355,7 @@ class PhoenixMemoryMetadata(BaseModel):
         data = self.model_dump(mode="json")
         provenance = data.pop("provenance", None)
         cortex = data.pop("cortex", None)
+        tool_learning = data.pop("tool_learning", None)
 
         metadata: dict[str, str] = {
             f"{PHOENIX_METADATA_PREFIX}schema_version": str(data.pop("schema_version")),
@@ -273,6 +390,16 @@ class PhoenixMemoryMetadata(BaseModel):
                     metadata[f"{PHOENIX_METADATA_PREFIX}cortex_{key}"] = str(value)
             if evidence_ids:
                 metadata[f"{PHOENIX_METADATA_PREFIX}cortex_evidence_ids"] = json.dumps(
+                    evidence_ids, separators=(",", ":"), ensure_ascii=False
+                )
+
+        if tool_learning:
+            evidence_ids = tool_learning.pop("evidence_ids", [])
+            for key, value in tool_learning.items():
+                if value is not None:
+                    metadata[f"{PHOENIX_METADATA_PREFIX}tool_learning_{key}"] = str(value)
+            if evidence_ids:
+                metadata[f"{PHOENIX_METADATA_PREFIX}tool_learning_evidence_ids"] = json.dumps(
                     evidence_ids, separators=(",", ":"), ensure_ascii=False
                 )
 
@@ -323,6 +450,16 @@ def _safe_enum(enum_type, value: str | None, default):
         return default
 
 
+def _safe_positive_int(value: str | None, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 1 else default
+
+
 def _parse_cortex_record(metadata: dict[str, str]) -> PhoenixCortexRecord | None:
     prefix = f"{PHOENIX_METADATA_PREFIX}cortex_"
     if not any(key.startswith(prefix) for key in metadata):
@@ -363,6 +500,49 @@ def _parse_cortex_record(metadata: dict[str, str]) -> PhoenixCortexRecord | None
         return None
 
 
+def _parse_tool_learning_record(
+    metadata: dict[str, str],
+) -> PhoenixToolLearningRecord | None:
+    prefix = f"{PHOENIX_METADATA_PREFIX}tool_learning_"
+    if not any(key.startswith(prefix) for key in metadata):
+        return None
+
+    if metadata.get(f"{prefix}schema_version") != PHOENIX_TOOL_LEARNING_SCHEMA_VERSION:
+        return None
+
+    record_kind_raw = metadata.get(f"{prefix}record_kind")
+    record_id = metadata.get(f"{prefix}record_id")
+    if not record_kind_raw or not record_id:
+        return None
+
+    try:
+        record_kind = PhoenixToolLearningKind(record_kind_raw)
+    except ValueError:
+        return None
+
+    try:
+        return PhoenixToolLearningRecord(
+            record_kind=record_kind,
+            record_id=record_id,
+            tool_name=metadata.get(f"{prefix}tool_name"),
+            operation=metadata.get(f"{prefix}operation"),
+            attempt=_safe_positive_int(metadata.get(f"{prefix}attempt"), 1),
+            parent_id=metadata.get(f"{prefix}parent_id"),
+            previous_attempt_id=metadata.get(f"{prefix}previous_attempt_id"),
+            failure_signature=metadata.get(f"{prefix}failure_signature"),
+            error_class=metadata.get(f"{prefix}error_class"),
+            error_code=metadata.get(f"{prefix}error_code"),
+            repair_summary=metadata.get(f"{prefix}repair_summary"),
+            success_pattern=metadata.get(f"{prefix}success_pattern"),
+            evidence_ids=_safe_json_string_list(metadata.get(f"{prefix}evidence_ids")),
+            observed_at=metadata.get(f"{prefix}observed_at"),
+        )
+    except Exception:
+        # Tool-learning metadata is advisory. Malformed extension fields must
+        # never break ordinary Phoenix memory recall.
+        return None
+
+
 def parse_phoenix_metadata(metadata: dict[str, str] | None) -> PhoenixMemoryMetadata | None:
     """Parse Phoenix metadata without allowing remembered authority to escalate.
 
@@ -388,6 +568,13 @@ def parse_phoenix_metadata(metadata: dict[str, str] | None) -> PhoenixMemoryMeta
             provenance = None
 
     cortex = _parse_cortex_record(metadata)
+    tool_learning = _parse_tool_learning_record(metadata)
+    if cortex is not None and tool_learning is not None:
+        # Conflicting native envelopes fail soft instead of allowing either
+        # extension to reinterpret the base memory.
+        cortex = None
+        tool_learning = None
+
     memory_class = _safe_enum(
         PhoenixMemoryClass,
         metadata.get(f"{PHOENIX_METADATA_PREFIX}memory_class"),
@@ -395,6 +582,8 @@ def parse_phoenix_metadata(metadata: dict[str, str] | None) -> PhoenixMemoryMeta
     )
     if cortex is not None:
         memory_class = PhoenixMemoryClass.CORTEX_EVIDENCE
+    elif tool_learning is not None:
+        memory_class = TOOL_LEARNING_MEMORY_CLASS[tool_learning.record_kind]
 
     related_files = _safe_json_string_list(
         metadata.get(f"{PHOENIX_METADATA_PREFIX}related_files")
@@ -435,6 +624,7 @@ def parse_phoenix_metadata(metadata: dict[str, str] | None) -> PhoenixMemoryMeta
             related_process=metadata.get(f"{PHOENIX_METADATA_PREFIX}related_process"),
             cortex_topic=metadata.get(f"{PHOENIX_METADATA_PREFIX}cortex_topic"),
             cortex=cortex,
+            tool_learning=tool_learning,
             provenance=provenance,
         )
     except Exception:
