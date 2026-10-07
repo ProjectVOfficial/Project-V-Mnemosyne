@@ -21,6 +21,8 @@ PHOENIX_METADATA_PREFIX = "pv_"
 PHOENIX_CORTEX_SCHEMA_VERSION = "1"
 PHOENIX_TOOL_LEARNING_SCHEMA_VERSION = "1"
 PHOENIX_CLAIM_SCHEMA_VERSION = "1"
+PHOENIX_RETENTION_SCHEMA_VERSION = "1"
+PHOENIX_RETENTION_SCORE_VERSION = "1"
 
 MAX_CORTEX_RECORD_ID_LENGTH = 256
 MAX_CORTEX_TOPIC_LENGTH = 512
@@ -47,6 +49,18 @@ MAX_CLAIM_RECORD_ID_LENGTH = 256
 MAX_CLAIM_RELATION_IDS = 32
 MAX_CLAIM_RESOLUTION_BASIS_LENGTH = 1024
 MAX_CLAIM_OBSERVED_AT_LENGTH = 128
+
+MAX_RETENTION_SCORED_AT_LENGTH = 128
+MAX_RETENTION_PROTECTED_REASON_LENGTH = 512
+
+RETENTION_WEIGHT_VERIFICATION = 0.30
+RETENTION_WEIGHT_CONFIDENCE = 0.20
+RETENTION_WEIGHT_RECENCY = 0.15
+RETENTION_WEIGHT_CORROBORATION = 0.15
+RETENTION_WEIGHT_UTILITY = 0.10
+RETENTION_WEIGHT_ENVIRONMENT = 0.10
+RETENTION_STALENESS_PENALTY = 0.25
+RETENTION_CONTRADICTION_PENALTY = 0.10
 
 
 class PhoenixMemoryClass(StrEnum):
@@ -131,6 +145,14 @@ class PhoenixClaimResolutionState(StrEnum):
     UNRESOLVED = "unresolved"
     RESOLVED = "resolved"
     NOT_APPLICABLE = "not_applicable"
+
+
+class PhoenixRetentionState(StrEnum):
+    HOT = "hot"
+    WARM = "warm"
+    COLD = "cold"
+    ARCHIVE_CANDIDATE = "archive_candidate"
+    PROTECTED = "protected"
 
 
 TOOL_LEARNING_MEMORY_CLASS: dict[PhoenixToolLearningKind, PhoenixMemoryClass] = {
@@ -383,6 +405,42 @@ class PhoenixClaimLineage(BaseModel):
         return self
 
 
+class PhoenixRetentionMetadata(BaseModel):
+    """Bounded retention/scoring metadata for deterministic memory ranking."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1"] = PHOENIX_RETENTION_SCHEMA_VERSION
+    score: float = Field(ge=0.0, le=1.0)
+    state: PhoenixRetentionState
+    score_version: Literal["1"] = PHOENIX_RETENTION_SCORE_VERSION
+    verification_strength: float = Field(default=0.0, ge=0.0, le=1.0)
+    recency: float = Field(default=0.0, ge=0.0, le=1.0)
+    corroboration: float = Field(default=0.0, ge=0.0, le=1.0)
+    utility: float = Field(default=0.0, ge=0.0, le=1.0)
+    environment_match: float = Field(default=0.0, ge=0.0, le=1.0)
+    staleness_penalty: float = Field(default=0.0, ge=0.0, le=1.0)
+    contradiction_penalty: float = Field(default=0.0, ge=0.0, le=1.0)
+    scored_at: str | None = Field(default=None, max_length=MAX_RETENTION_SCORED_AT_LENGTH)
+    protected_reason: str | None = Field(
+        default=None, max_length=MAX_RETENTION_PROTECTED_REASON_LENGTH
+    )
+
+    @field_validator("scored_at", "protected_reason")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+    @model_validator(mode="after")
+    def validate_protected_state(self) -> "PhoenixRetentionMetadata":
+        if self.state != PhoenixRetentionState.PROTECTED and self.protected_reason is not None:
+            raise ValueError("protected_reason requires retention state=protected")
+        return self
+
+
 class PhoenixMemoryMetadata(BaseModel):
     """Phoenix-native semantics carried through Hindsight-compatible metadata."""
 
@@ -411,6 +469,7 @@ class PhoenixMemoryMetadata(BaseModel):
     cortex: PhoenixCortexRecord | None = None
     tool_learning: PhoenixToolLearningRecord | None = None
     claim: PhoenixClaimLineage | None = None
+    retention: PhoenixRetentionMetadata | None = None
     provenance: PhoenixProvenance | None = None
 
     @field_validator(
@@ -483,6 +542,7 @@ class PhoenixMemoryMetadata(BaseModel):
         cortex = data.pop("cortex", None)
         tool_learning = data.pop("tool_learning", None)
         claim = data.pop("claim", None)
+        retention = data.pop("retention", None)
 
         metadata: dict[str, str] = {
             f"{PHOENIX_METADATA_PREFIX}schema_version": str(data.pop("schema_version")),
@@ -548,6 +608,17 @@ class PhoenixMemoryMetadata(BaseModel):
                     metadata[f"{PHOENIX_METADATA_PREFIX}claim_{key}"] = json.dumps(
                         values, separators=(",", ":"), ensure_ascii=False
                     )
+
+        if retention:
+            for key, value in retention.items():
+                if value is None:
+                    continue
+                if isinstance(value, float):
+                    metadata[f"{PHOENIX_METADATA_PREFIX}retention_{key}"] = format(
+                        value, ".6g"
+                    )
+                else:
+                    metadata[f"{PHOENIX_METADATA_PREFIX}retention_{key}"] = str(value)
 
         if provenance:
             for key, value in provenance.items():
@@ -732,6 +803,54 @@ def _parse_claim_lineage(metadata: dict[str, str]) -> PhoenixClaimLineage | None
         return None
 
 
+def _parse_retention_metadata(
+    metadata: dict[str, str],
+) -> PhoenixRetentionMetadata | None:
+    prefix = f"{PHOENIX_METADATA_PREFIX}retention_"
+    if not any(key.startswith(prefix) for key in metadata):
+        return None
+
+    if metadata.get(f"{prefix}schema_version") != PHOENIX_RETENTION_SCHEMA_VERSION:
+        return None
+    if metadata.get(f"{prefix}score_version") != PHOENIX_RETENTION_SCORE_VERSION:
+        return None
+
+    state = _safe_enum(
+        PhoenixRetentionState,
+        metadata.get(f"{prefix}state"),
+        None,
+    )
+    if state is None:
+        return None
+
+    score = _safe_float(metadata.get(f"{prefix}score"), None)
+    if score is None:
+        return None
+
+    def bounded(key: str) -> float:
+        value = _safe_float(metadata.get(f"{prefix}{key}"), 0.0)
+        return 0.0 if value is None else value
+
+    try:
+        return PhoenixRetentionMetadata(
+            score=score,
+            state=state,
+            verification_strength=bounded("verification_strength"),
+            recency=bounded("recency"),
+            corroboration=bounded("corroboration"),
+            utility=bounded("utility"),
+            environment_match=bounded("environment_match"),
+            staleness_penalty=bounded("staleness_penalty"),
+            contradiction_penalty=bounded("contradiction_penalty"),
+            scored_at=metadata.get(f"{prefix}scored_at"),
+            protected_reason=metadata.get(f"{prefix}protected_reason"),
+        )
+    except Exception:
+        # Retention metadata is advisory. Malformed scoring fields must never
+        # break ordinary Phoenix recall or alter the base memory.
+        return None
+
+
 def parse_phoenix_metadata(metadata: dict[str, str] | None) -> PhoenixMemoryMetadata | None:
     """Parse Phoenix metadata without allowing remembered authority to escalate.
 
@@ -759,6 +878,7 @@ def parse_phoenix_metadata(metadata: dict[str, str] | None) -> PhoenixMemoryMeta
     cortex = _parse_cortex_record(metadata)
     tool_learning = _parse_tool_learning_record(metadata)
     claim = _parse_claim_lineage(metadata)
+    retention = _parse_retention_metadata(metadata)
     if cortex is not None and tool_learning is not None:
         # Conflicting native envelopes fail soft instead of allowing either
         # extension to reinterpret the base memory.
@@ -816,6 +936,7 @@ def parse_phoenix_metadata(metadata: dict[str, str] | None) -> PhoenixMemoryMeta
             cortex=cortex,
             tool_learning=tool_learning,
             claim=claim,
+            retention=retention,
             provenance=provenance,
         )
     except Exception:
