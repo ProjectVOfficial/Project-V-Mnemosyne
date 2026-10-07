@@ -1,6 +1,10 @@
 from hindsight_api.phoenix_metadata import (
+    MAX_CLAIM_RELATION_IDS,
     MAX_CORTEX_EVIDENCE_IDS,
     MAX_TOOL_LEARNING_EVIDENCE_IDS,
+    PhoenixClaimLineage,
+    PhoenixClaimResolutionState,
+    PhoenixClaimState,
     PhoenixCortexRecord,
     PhoenixCortexRecordKind,
     PhoenixCortexRecordState,
@@ -370,3 +374,223 @@ def test_tool_learning_and_cortex_envelopes_cannot_coexist_on_write() -> None:
         pass
     else:
         raise AssertionError("Cortex and tool-learning native envelopes must be mutually exclusive")
+
+def test_claim_lineage_serializes_to_hindsight_string_map() -> None:
+    item = PhoenixMemoryMetadata(
+        source="manual",
+        project="Phoenix",
+        memory_class=PhoenixMemoryClass.PROJECT_FACT,
+        confidence=0.95,
+        claim=PhoenixClaimLineage(
+            claim_key="phoenix:active-memory-provider",
+            state=PhoenixClaimState.DISPUTED,
+            value="mnemosyne",
+            value_hash="A" * 64,
+            supports_ids=["fact-1", "fact-1", "fact-2"],
+            contradicts_ids=["fact-old"],
+            supersedes_ids=["fact-legacy"],
+            resolution_state=PhoenixClaimResolutionState.UNRESOLVED,
+            resolution_basis="Conflicting observed evidence remains unresolved.",
+            observed_at="2026-10-07T11:45:00-05:00",
+        ),
+    )
+
+    metadata = item.to_hindsight_metadata()
+
+    assert metadata["pv_claim_schema_version"] == "1"
+    assert metadata["pv_claim_claim_key"] == "phoenix:active-memory-provider"
+    assert metadata["pv_claim_state"] == "disputed"
+    assert metadata["pv_claim_value"] == "mnemosyne"
+    assert metadata["pv_claim_value_hash"] == "a" * 64
+    assert metadata["pv_claim_supports_ids"] == '["fact-1","fact-2"]'
+    assert metadata["pv_claim_contradicts_ids"] == '["fact-old"]'
+    assert metadata["pv_claim_supersedes_ids"] == '["fact-legacy"]'
+    assert metadata["pv_claim_resolution_state"] == "unresolved"
+    assert metadata["pv_authority"] == "context_only"
+    assert all(isinstance(value, str) for value in metadata.values())
+
+
+def test_claim_lineage_round_trip_preserves_semantics() -> None:
+    original = PhoenixMemoryMetadata(
+        source="cortex",
+        project="Phoenix",
+        memory_class=PhoenixMemoryClass.CORTEX_EVIDENCE,
+        confidence=0.93,
+        cortex=PhoenixCortexRecord(
+            record_kind=PhoenixCortexRecordKind.TEMPORAL_BELIEF,
+            record_id="belief-provider-2",
+            topic="active memory provider",
+            state=PhoenixCortexRecordState.CURRENT,
+            confidence=0.91,
+        ),
+        claim=PhoenixClaimLineage(
+            claim_key="phoenix:active-memory-provider",
+            state=PhoenixClaimState.CURRENT,
+            value="mnemosyne",
+            value_hash="b" * 64,
+            supersedes_ids=["belief-provider-1"],
+            resolution_state=PhoenixClaimResolutionState.RESOLVED,
+            resolution_basis="Newer verified configuration evidence.",
+            observed_at="2026-10-07T11:46:00-05:00",
+        ),
+    )
+
+    parsed = parse_phoenix_metadata(original.to_hindsight_metadata())
+
+    assert parsed is not None
+    assert parsed.cortex is not None
+    assert parsed.cortex.record_id == "belief-provider-2"
+    assert parsed.claim is not None
+    assert parsed.claim.claim_key == "phoenix:active-memory-provider"
+    assert parsed.claim.state == PhoenixClaimState.CURRENT
+    assert parsed.claim.value == "mnemosyne"
+    assert parsed.claim.supersedes_ids == ["belief-provider-1"]
+    assert parsed.claim.resolution_state == PhoenixClaimResolutionState.RESOLVED
+    assert parsed.authority == "context_only"
+
+
+def test_claim_lineage_can_coexist_with_tool_learning_record() -> None:
+    original = PhoenixMemoryMetadata(
+        source="tool",
+        tool="workspace.write",
+        memory_class=PhoenixMemoryClass.TOOL_RESULT,
+        outcome=PhoenixOutcome.SUCCESS,
+        verification=PhoenixVerification.TEST_VERIFIED,
+        tool_learning=PhoenixToolLearningRecord(
+            record_kind=PhoenixToolLearningKind.TOOL_OUTCOME,
+            record_id="tool-provider-2",
+            tool_name="workspace.write",
+            operation="update provider configuration",
+        ),
+        claim=PhoenixClaimLineage(
+            claim_key="phoenix:active-memory-provider",
+            state=PhoenixClaimState.CURRENT,
+            value="mnemosyne",
+            value_hash="c" * 64,
+            supports_ids=["belief-provider-2"],
+            resolution_state=PhoenixClaimResolutionState.RESOLVED,
+        ),
+    )
+
+    parsed = parse_phoenix_metadata(original.to_hindsight_metadata())
+
+    assert parsed is not None
+    assert parsed.tool_learning is not None
+    assert parsed.tool_learning.record_id == "tool-provider-2"
+    assert parsed.claim is not None
+    assert parsed.claim.supports_ids == ["belief-provider-2"]
+    assert parsed.authority == "context_only"
+
+
+def test_claim_relation_categories_cannot_overlap() -> None:
+    try:
+        PhoenixClaimLineage(
+            claim_key="phoenix:test-overlap",
+            supports_ids=["record-1"],
+            contradicts_ids=["record-1"],
+        )
+    except Exception:
+        pass
+    else:
+        raise AssertionError("Claim target IDs must not appear in multiple relation categories")
+
+
+def test_claim_native_record_cannot_relate_to_itself() -> None:
+    try:
+        PhoenixMemoryMetadata(
+            memory_class=PhoenixMemoryClass.TOOL_RESULT,
+            tool_learning=PhoenixToolLearningRecord(
+                record_kind=PhoenixToolLearningKind.TOOL_OUTCOME,
+                record_id="tool-self-1",
+            ),
+            claim=PhoenixClaimLineage(
+                claim_key="phoenix:self-relation",
+                contradicts_ids=["tool-self-1"],
+            ),
+        )
+    except Exception:
+        pass
+    else:
+        raise AssertionError("Claim lineage must not relate a native record to itself")
+
+
+def test_claim_relation_id_count_is_bounded() -> None:
+    too_many = [f"claim-{index}" for index in range(MAX_CLAIM_RELATION_IDS + 1)]
+    try:
+        PhoenixClaimLineage(
+            claim_key="phoenix:bounded-relations",
+            supports_ids=too_many,
+        )
+    except Exception:
+        pass
+    else:
+        raise AssertionError("Claim relation IDs must be bounded")
+
+
+def test_malformed_claim_lineage_fails_soft_without_breaking_base_memory() -> None:
+    metadata = PhoenixMemoryMetadata(
+        source="manual",
+        project="Phoenix",
+        memory_class=PhoenixMemoryClass.PROJECT_FACT,
+        confidence=0.9,
+    ).to_hindsight_metadata()
+    metadata.update(
+        {
+            "pv_claim_schema_version": "1",
+            "pv_claim_claim_key": "phoenix:malformed-claim",
+            "pv_claim_supports_ids": '["same-record"]',
+            "pv_claim_contradicts_ids": '["same-record"]',
+        }
+    )
+
+    parsed = parse_phoenix_metadata(metadata)
+
+    assert parsed is not None
+    assert parsed.memory_class == PhoenixMemoryClass.PROJECT_FACT
+    assert parsed.claim is None
+    assert parsed.project == "Phoenix"
+    assert parsed.authority == "context_only"
+
+
+def test_unknown_claim_enums_fail_soft_to_safe_defaults() -> None:
+    metadata = PhoenixMemoryMetadata(
+        source="manual",
+        memory_class=PhoenixMemoryClass.PROJECT_FACT,
+    ).to_hindsight_metadata()
+    metadata.update(
+        {
+            "pv_claim_schema_version": "1",
+            "pv_claim_claim_key": "phoenix:future-claim",
+            "pv_claim_state": "future_state",
+            "pv_claim_resolution_state": "future_resolution",
+        }
+    )
+
+    parsed = parse_phoenix_metadata(metadata)
+
+    assert parsed is not None
+    assert parsed.claim is not None
+    assert parsed.claim.state == PhoenixClaimState.UNKNOWN
+    assert parsed.claim.resolution_state == PhoenixClaimResolutionState.UNRESOLVED
+    assert parsed.authority == "context_only"
+
+
+def test_invalid_claim_hash_fails_soft_without_breaking_base_memory() -> None:
+    metadata = PhoenixMemoryMetadata(
+        source="manual",
+        memory_class=PhoenixMemoryClass.PROJECT_FACT,
+    ).to_hindsight_metadata()
+    metadata.update(
+        {
+            "pv_claim_schema_version": "1",
+            "pv_claim_claim_key": "phoenix:bad-hash",
+            "pv_claim_value_hash": "not-a-sha256",
+        }
+    )
+
+    parsed = parse_phoenix_metadata(metadata)
+
+    assert parsed is not None
+    assert parsed.claim is None
+    assert parsed.authority == "context_only"
+
