@@ -535,8 +535,10 @@ class PhoenixMemoryMetadata(BaseModel):
             contradicts_ids = claim.pop("contradicts_ids", [])
             supersedes_ids = claim.pop("supersedes_ids", [])
             for key, value in claim.items():
-                if value is not None:
-                    metadata[f"{PHOENIX_METADATA_PREFIX}claim_{key}"] = str(value)
+                if value is None:
+                    continue
+                suffix = "key" if key == "claim_key" else key
+                metadata[f"{PHOENIX_METADATA_PREFIX}claim_{suffix}"] = str(value)
             for key, values in (
                 ("supports_ids", supports_ids),
                 ("contradicts_ids", contradicts_ids),
@@ -695,7 +697,7 @@ def _parse_claim_lineage(metadata: dict[str, str]) -> PhoenixClaimLineage | None
     if metadata.get(f"{prefix}schema_version") != PHOENIX_CLAIM_SCHEMA_VERSION:
         return None
 
-    claim_key = metadata.get(f"{prefix}claim_key")
+    claim_key = metadata.get(f"{prefix}key") or metadata.get(f"{prefix}claim_key")
     if not claim_key:
         return None
 

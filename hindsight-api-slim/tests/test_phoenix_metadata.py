@@ -398,7 +398,7 @@ def test_claim_lineage_serializes_to_hindsight_string_map() -> None:
     metadata = item.to_hindsight_metadata()
 
     assert metadata["pv_claim_schema_version"] == "1"
-    assert metadata["pv_claim_claim_key"] == "phoenix:active-memory-provider"
+    assert metadata["pv_claim_key"] == "phoenix:active-memory-provider"
     assert metadata["pv_claim_state"] == "disputed"
     assert metadata["pv_claim_value"] == "mnemosyne"
     assert metadata["pv_claim_value_hash"] == "a" * 64
@@ -537,7 +537,7 @@ def test_malformed_claim_lineage_fails_soft_without_breaking_base_memory() -> No
     metadata.update(
         {
             "pv_claim_schema_version": "1",
-            "pv_claim_claim_key": "phoenix:malformed-claim",
+            "pv_claim_key": "phoenix:malformed-claim",
             "pv_claim_supports_ids": '["same-record"]',
             "pv_claim_contradicts_ids": '["same-record"]',
         }
@@ -560,7 +560,7 @@ def test_unknown_claim_enums_fail_soft_to_safe_defaults() -> None:
     metadata.update(
         {
             "pv_claim_schema_version": "1",
-            "pv_claim_claim_key": "phoenix:future-claim",
+            "pv_claim_key": "phoenix:future-claim",
             "pv_claim_state": "future_state",
             "pv_claim_resolution_state": "future_resolution",
         }
@@ -583,7 +583,7 @@ def test_invalid_claim_hash_fails_soft_without_breaking_base_memory() -> None:
     metadata.update(
         {
             "pv_claim_schema_version": "1",
-            "pv_claim_claim_key": "phoenix:bad-hash",
+            "pv_claim_key": "phoenix:bad-hash",
             "pv_claim_value_hash": "not-a-sha256",
         }
     )
@@ -594,3 +594,21 @@ def test_invalid_claim_hash_fails_soft_without_breaking_base_memory() -> None:
     assert parsed.claim is None
     assert parsed.authority == "context_only"
 
+
+
+def test_legacy_claim_claim_key_alias_remains_readable() -> None:
+    metadata = PhoenixMemoryMetadata(
+        source="manual",
+        memory_class=PhoenixMemoryClass.PROJECT_FACT,
+    ).to_hindsight_metadata()
+    metadata["pv_claim_schema_version"] = "1"
+    metadata["pv_claim_claim_key"] = "mnemosyne-06c:legacy-claim-key"
+    metadata["pv_claim_state"] = "disputed"
+    metadata["pv_claim_resolution_state"] = "unresolved"
+
+    parsed = parse_phoenix_metadata(metadata)
+
+    assert parsed is not None
+    assert parsed.claim is not None
+    assert parsed.claim.claim_key == "mnemosyne-06c:legacy-claim-key"
+    assert parsed.authority == "context_only"
