@@ -20,6 +20,7 @@ PHOENIX_METADATA_SCHEMA_VERSION = "1"
 PHOENIX_METADATA_PREFIX = "pv_"
 PHOENIX_CORTEX_SCHEMA_VERSION = "1"
 PHOENIX_TOOL_LEARNING_SCHEMA_VERSION = "1"
+PHOENIX_CLAIM_SCHEMA_VERSION = "1"
 
 MAX_CORTEX_RECORD_ID_LENGTH = 256
 MAX_CORTEX_TOPIC_LENGTH = 512
@@ -38,6 +39,14 @@ MAX_TOOL_LEARNING_REPAIR_SUMMARY_LENGTH = 1024
 MAX_TOOL_LEARNING_SUCCESS_PATTERN_LENGTH = 1024
 MAX_TOOL_LEARNING_OBSERVED_AT_LENGTH = 128
 MAX_TOOL_LEARNING_EVIDENCE_IDS = 32
+
+MAX_CLAIM_KEY_LENGTH = 256
+MAX_CLAIM_VALUE_LENGTH = 1024
+MAX_CLAIM_VALUE_HASH_LENGTH = 64
+MAX_CLAIM_RECORD_ID_LENGTH = 256
+MAX_CLAIM_RELATION_IDS = 32
+MAX_CLAIM_RESOLUTION_BASIS_LENGTH = 1024
+MAX_CLAIM_OBSERVED_AT_LENGTH = 128
 
 
 class PhoenixMemoryClass(StrEnum):
@@ -108,6 +117,20 @@ class PhoenixToolLearningKind(StrEnum):
     REPAIR_ATTEMPT = "repair_attempt"
     FAILURE = "failure"
     SUCCESS_PATTERN = "success_pattern"
+
+
+class PhoenixClaimState(StrEnum):
+    CURRENT = "current"
+    HISTORICAL = "historical"
+    DISPUTED = "disputed"
+    SUPERSEDED = "superseded"
+    UNKNOWN = "unknown"
+
+
+class PhoenixClaimResolutionState(StrEnum):
+    UNRESOLVED = "unresolved"
+    RESOLVED = "resolved"
+    NOT_APPLICABLE = "not_applicable"
 
 
 TOOL_LEARNING_MEMORY_CLASS: dict[PhoenixToolLearningKind, PhoenixMemoryClass] = {
@@ -276,6 +299,90 @@ class PhoenixToolLearningRecord(BaseModel):
         return result
 
 
+class PhoenixClaimLineage(BaseModel):
+    """Bounded claim lineage used for provenance and contradiction handling."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1"] = PHOENIX_CLAIM_SCHEMA_VERSION
+    claim_key: str = Field(min_length=1, max_length=MAX_CLAIM_KEY_LENGTH)
+    state: PhoenixClaimState = PhoenixClaimState.UNKNOWN
+    value: str | None = Field(default=None, max_length=MAX_CLAIM_VALUE_LENGTH)
+    value_hash: str | None = Field(default=None, max_length=MAX_CLAIM_VALUE_HASH_LENGTH)
+    supports_ids: list[str] = Field(default_factory=list, max_length=MAX_CLAIM_RELATION_IDS)
+    contradicts_ids: list[str] = Field(default_factory=list, max_length=MAX_CLAIM_RELATION_IDS)
+    supersedes_ids: list[str] = Field(default_factory=list, max_length=MAX_CLAIM_RELATION_IDS)
+    resolution_state: PhoenixClaimResolutionState = PhoenixClaimResolutionState.UNRESOLVED
+    resolution_basis: str | None = Field(
+        default=None, max_length=MAX_CLAIM_RESOLUTION_BASIS_LENGTH
+    )
+    observed_at: str | None = Field(default=None, max_length=MAX_CLAIM_OBSERVED_AT_LENGTH)
+
+    @field_validator("claim_key")
+    @classmethod
+    def normalize_claim_key(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Claim key must not be empty")
+        return value
+
+    @field_validator("value", "resolution_basis", "observed_at")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+    @field_validator("value_hash")
+    @classmethod
+    def normalize_value_hash(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip().lower()
+        if not value:
+            return None
+        if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+            raise ValueError("Claim value_hash must be a 64-character SHA-256 hex digest")
+        return value
+
+    @field_validator("supports_ids", "contradicts_ids", "supersedes_ids")
+    @classmethod
+    def normalize_relation_ids(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for raw in value:
+            item = str(raw).strip()
+            if not item:
+                continue
+            if len(item) > MAX_CLAIM_RECORD_ID_LENGTH:
+                raise ValueError(
+                    f"Claim relation id exceeds {MAX_CLAIM_RECORD_ID_LENGTH} characters"
+                )
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        if len(result) > MAX_CLAIM_RELATION_IDS:
+            raise ValueError(f"Claim relation list exceeds {MAX_CLAIM_RELATION_IDS} entries")
+        return result
+
+    @model_validator(mode="after")
+    def validate_relation_categories(self) -> "PhoenixClaimLineage":
+        supports = set(self.supports_ids)
+        contradicts = set(self.contradicts_ids)
+        supersedes = set(self.supersedes_ids)
+        overlap = (
+            (supports & contradicts)
+            | (supports & supersedes)
+            | (contradicts & supersedes)
+        )
+        if overlap:
+            raise ValueError(
+                "Claim relation target cannot appear in more than one relation category"
+            )
+        return self
+
+
 class PhoenixMemoryMetadata(BaseModel):
     """Phoenix-native semantics carried through Hindsight-compatible metadata."""
 
@@ -303,6 +410,7 @@ class PhoenixMemoryMetadata(BaseModel):
     cortex_topic: str | None = None
     cortex: PhoenixCortexRecord | None = None
     tool_learning: PhoenixToolLearningRecord | None = None
+    claim: PhoenixClaimLineage | None = None
     provenance: PhoenixProvenance | None = None
 
     @field_validator(
@@ -347,6 +455,24 @@ class PhoenixMemoryMetadata(BaseModel):
                     f"Tool-learning kind {self.tool_learning.record_kind.value} "
                     f"must use memory_class={expected.value}"
                 )
+
+        # Claim lineage may coexist with either native envelope, but when an
+        # owning stable record ID is available it may never relate the record to
+        # itself. Base memories without a native stable ID are checked later by
+        # the Phoenix write adapter once their durable ID is known.
+        if self.claim is not None:
+            owner_ids: set[str] = set()
+            if self.cortex is not None:
+                owner_ids.add(self.cortex.record_id)
+            if self.tool_learning is not None:
+                owner_ids.add(self.tool_learning.record_id)
+            related_ids = (
+                set(self.claim.supports_ids)
+                | set(self.claim.contradicts_ids)
+                | set(self.claim.supersedes_ids)
+            )
+            if owner_ids & related_ids:
+                raise ValueError("Claim lineage cannot relate a native record to itself")
         return self
 
     def to_hindsight_metadata(self) -> dict[str, str]:
@@ -356,6 +482,7 @@ class PhoenixMemoryMetadata(BaseModel):
         provenance = data.pop("provenance", None)
         cortex = data.pop("cortex", None)
         tool_learning = data.pop("tool_learning", None)
+        claim = data.pop("claim", None)
 
         metadata: dict[str, str] = {
             f"{PHOENIX_METADATA_PREFIX}schema_version": str(data.pop("schema_version")),
@@ -402,6 +529,25 @@ class PhoenixMemoryMetadata(BaseModel):
                 metadata[f"{PHOENIX_METADATA_PREFIX}tool_learning_evidence_ids"] = json.dumps(
                     evidence_ids, separators=(",", ":"), ensure_ascii=False
                 )
+
+        if claim:
+            supports_ids = claim.pop("supports_ids", [])
+            contradicts_ids = claim.pop("contradicts_ids", [])
+            supersedes_ids = claim.pop("supersedes_ids", [])
+            for key, value in claim.items():
+                if value is None:
+                    continue
+                suffix = "key" if key == "claim_key" else key
+                metadata[f"{PHOENIX_METADATA_PREFIX}claim_{suffix}"] = str(value)
+            for key, values in (
+                ("supports_ids", supports_ids),
+                ("contradicts_ids", contradicts_ids),
+                ("supersedes_ids", supersedes_ids),
+            ):
+                if values:
+                    metadata[f"{PHOENIX_METADATA_PREFIX}claim_{key}"] = json.dumps(
+                        values, separators=(",", ":"), ensure_ascii=False
+                    )
 
         if provenance:
             for key, value in provenance.items():
@@ -543,6 +689,49 @@ def _parse_tool_learning_record(
         return None
 
 
+def _parse_claim_lineage(metadata: dict[str, str]) -> PhoenixClaimLineage | None:
+    prefix = f"{PHOENIX_METADATA_PREFIX}claim_"
+    if not any(key.startswith(prefix) for key in metadata):
+        return None
+
+    if metadata.get(f"{prefix}schema_version") != PHOENIX_CLAIM_SCHEMA_VERSION:
+        return None
+
+    claim_key = metadata.get(f"{prefix}key") or metadata.get(f"{prefix}claim_key")
+    if not claim_key:
+        return None
+
+    try:
+        return PhoenixClaimLineage(
+            claim_key=claim_key,
+            state=_safe_enum(
+                PhoenixClaimState,
+                metadata.get(f"{prefix}state"),
+                PhoenixClaimState.UNKNOWN,
+            ),
+            value=metadata.get(f"{prefix}value"),
+            value_hash=metadata.get(f"{prefix}value_hash"),
+            supports_ids=_safe_json_string_list(metadata.get(f"{prefix}supports_ids")),
+            contradicts_ids=_safe_json_string_list(
+                metadata.get(f"{prefix}contradicts_ids")
+            ),
+            supersedes_ids=_safe_json_string_list(
+                metadata.get(f"{prefix}supersedes_ids")
+            ),
+            resolution_state=_safe_enum(
+                PhoenixClaimResolutionState,
+                metadata.get(f"{prefix}resolution_state"),
+                PhoenixClaimResolutionState.UNRESOLVED,
+            ),
+            resolution_basis=metadata.get(f"{prefix}resolution_basis"),
+            observed_at=metadata.get(f"{prefix}observed_at"),
+        )
+    except Exception:
+        # Claim lineage is advisory. Malformed contradiction/provenance fields
+        # must never break ordinary Phoenix memory recall.
+        return None
+
+
 def parse_phoenix_metadata(metadata: dict[str, str] | None) -> PhoenixMemoryMetadata | None:
     """Parse Phoenix metadata without allowing remembered authority to escalate.
 
@@ -569,6 +758,7 @@ def parse_phoenix_metadata(metadata: dict[str, str] | None) -> PhoenixMemoryMeta
 
     cortex = _parse_cortex_record(metadata)
     tool_learning = _parse_tool_learning_record(metadata)
+    claim = _parse_claim_lineage(metadata)
     if cortex is not None and tool_learning is not None:
         # Conflicting native envelopes fail soft instead of allowing either
         # extension to reinterpret the base memory.
@@ -625,6 +815,7 @@ def parse_phoenix_metadata(metadata: dict[str, str] | None) -> PhoenixMemoryMeta
             cortex_topic=metadata.get(f"{PHOENIX_METADATA_PREFIX}cortex_topic"),
             cortex=cortex,
             tool_learning=tool_learning,
+            claim=claim,
             provenance=provenance,
         )
     except Exception:
