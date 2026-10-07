@@ -1,5 +1,14 @@
 from hindsight_api.phoenix_metadata import (
     MAX_CLAIM_RELATION_IDS,
+    PHOENIX_RETENTION_SCORE_VERSION,
+    RETENTION_CONTRADICTION_PENALTY,
+    RETENTION_STALENESS_PENALTY,
+    RETENTION_WEIGHT_CONFIDENCE,
+    RETENTION_WEIGHT_CORROBORATION,
+    RETENTION_WEIGHT_ENVIRONMENT,
+    RETENTION_WEIGHT_RECENCY,
+    RETENTION_WEIGHT_UTILITY,
+    RETENTION_WEIGHT_VERIFICATION,
     MAX_CORTEX_EVIDENCE_IDS,
     MAX_TOOL_LEARNING_EVIDENCE_IDS,
     PhoenixClaimLineage,
@@ -10,6 +19,8 @@ from hindsight_api.phoenix_metadata import (
     PhoenixCortexRecordState,
     PhoenixMemoryClass,
     PhoenixMemoryMetadata,
+    PhoenixRetentionMetadata,
+    PhoenixRetentionState,
     PhoenixOutcome,
     PhoenixToolLearningKind,
     PhoenixToolLearningRecord,
@@ -611,4 +622,228 @@ def test_legacy_claim_claim_key_alias_remains_readable() -> None:
     assert parsed is not None
     assert parsed.claim is not None
     assert parsed.claim.claim_key == "mnemosyne-06c:legacy-claim-key"
+    assert parsed.authority == "context_only"
+
+
+def test_retention_metadata_serializes_to_hindsight_string_map() -> None:
+    item = PhoenixMemoryMetadata(
+        source="manual",
+        memory_class=PhoenixMemoryClass.PROJECT_FACT,
+        confidence=0.98,
+        retention=PhoenixRetentionMetadata(
+            score=0.86,
+            state=PhoenixRetentionState.HOT,
+            verification_strength=1.0,
+            recency=0.91,
+            corroboration=0.70,
+            utility=0.60,
+            environment_match=1.0,
+            staleness_penalty=0.0,
+            contradiction_penalty=0.0,
+            scored_at="2026-10-07T17:00:00Z",
+        ),
+    )
+
+    metadata = item.to_hindsight_metadata()
+
+    assert metadata["pv_retention_schema_version"] == "1"
+    assert metadata["pv_retention_score_version"] == PHOENIX_RETENTION_SCORE_VERSION
+    assert metadata["pv_retention_score"] == "0.86"
+    assert metadata["pv_retention_state"] == "hot"
+    assert metadata["pv_retention_verification_strength"] == "1"
+    assert metadata["pv_retention_recency"] == "0.91"
+    assert metadata["pv_retention_corroboration"] == "0.7"
+    assert metadata["pv_retention_utility"] == "0.6"
+    assert metadata["pv_retention_environment_match"] == "1"
+    assert metadata["pv_retention_staleness_penalty"] == "0"
+    assert metadata["pv_retention_contradiction_penalty"] == "0"
+    assert metadata["pv_authority"] == "context_only"
+    assert all(isinstance(value, str) for value in metadata.values())
+
+
+def test_retention_metadata_round_trip_preserves_semantics() -> None:
+    original = PhoenixMemoryMetadata(
+        source="manual",
+        memory_class=PhoenixMemoryClass.PROJECT_FACT,
+        confidence=0.97,
+        retention=PhoenixRetentionMetadata(
+            score=0.49,
+            state=PhoenixRetentionState.COLD,
+            verification_strength=0.8,
+            recency=0.3,
+            corroboration=0.5,
+            utility=0.4,
+            environment_match=1.0,
+            staleness_penalty=RETENTION_STALENESS_PENALTY,
+            contradiction_penalty=0.0,
+            scored_at="2026-10-07T17:05:00Z",
+        ),
+    )
+
+    parsed = parse_phoenix_metadata(original.to_hindsight_metadata())
+
+    assert parsed is not None
+    assert parsed.retention is not None
+    assert parsed.retention.score == 0.49
+    assert parsed.retention.state == PhoenixRetentionState.COLD
+    assert parsed.retention.staleness_penalty == RETENTION_STALENESS_PENALTY
+    assert parsed.authority == "context_only"
+
+
+def test_retention_components_and_penalties_are_bounded() -> None:
+    for field in (
+        "score",
+        "verification_strength",
+        "recency",
+        "corroboration",
+        "utility",
+        "environment_match",
+        "staleness_penalty",
+        "contradiction_penalty",
+    ):
+        for value in (-0.01, 1.01):
+            kwargs = dict(score=0.5, state=PhoenixRetentionState.WARM)
+            kwargs[field] = value
+            try:
+                PhoenixRetentionMetadata(**kwargs)
+            except Exception:
+                continue
+            raise AssertionError(f"{field} outside [0, 1] must be rejected")
+
+
+def test_retention_weights_are_versioned_and_sum_to_one() -> None:
+    total = (
+        RETENTION_WEIGHT_VERIFICATION
+        + RETENTION_WEIGHT_CONFIDENCE
+        + RETENTION_WEIGHT_RECENCY
+        + RETENTION_WEIGHT_CORROBORATION
+        + RETENTION_WEIGHT_UTILITY
+        + RETENTION_WEIGHT_ENVIRONMENT
+    )
+    assert PHOENIX_RETENTION_SCORE_VERSION == "1"
+    assert total == 1.0
+    assert RETENTION_STALENESS_PENALTY == 0.25
+    assert RETENTION_CONTRADICTION_PENALTY == 0.10
+
+
+def test_malformed_retention_metadata_fails_soft_without_breaking_base_memory() -> None:
+    metadata = PhoenixMemoryMetadata(
+        source="manual",
+        project="Phoenix",
+        memory_class=PhoenixMemoryClass.PROJECT_FACT,
+        confidence=0.9,
+    ).to_hindsight_metadata()
+    metadata.update(
+        {
+            "pv_retention_schema_version": "1",
+            "pv_retention_score_version": "1",
+            "pv_retention_score": "not-a-score",
+            "pv_retention_state": "hot",
+        }
+    )
+
+    parsed = parse_phoenix_metadata(metadata)
+
+    assert parsed is not None
+    assert parsed.memory_class == PhoenixMemoryClass.PROJECT_FACT
+    assert parsed.retention is None
+    assert parsed.project == "Phoenix"
+    assert parsed.authority == "context_only"
+
+
+def test_legacy_memory_without_retention_metadata_is_unchanged() -> None:
+    metadata = PhoenixMemoryMetadata(
+        source="legacy",
+        memory_class=PhoenixMemoryClass.PROJECT_FACT,
+        confidence=0.77,
+    ).to_hindsight_metadata()
+
+    parsed = parse_phoenix_metadata(metadata)
+
+    assert parsed is not None
+    assert parsed.retention is None
+    assert parsed.source == "legacy"
+    assert parsed.confidence == 0.77
+    assert parsed.authority == "context_only"
+
+
+def test_retention_coexists_with_claim_cortex_and_tool_learning_extensions() -> None:
+    cortex_item = PhoenixMemoryMetadata(
+        source="cortex",
+        memory_class=PhoenixMemoryClass.CORTEX_EVIDENCE,
+        cortex=PhoenixCortexRecord(
+            record_kind=PhoenixCortexRecordKind.DECISION,
+            record_id="decision-retention-1",
+        ),
+        claim=PhoenixClaimLineage(
+            claim_key="phoenix:retention-coexistence",
+            state=PhoenixClaimState.CURRENT,
+        ),
+        retention=PhoenixRetentionMetadata(
+            score=0.9,
+            state=PhoenixRetentionState.HOT,
+        ),
+    )
+    parsed_cortex = parse_phoenix_metadata(cortex_item.to_hindsight_metadata())
+    assert parsed_cortex is not None
+    assert parsed_cortex.cortex is not None
+    assert parsed_cortex.claim is not None
+    assert parsed_cortex.retention is not None
+
+    tool_item = PhoenixMemoryMetadata(
+        source="tool",
+        memory_class=PhoenixMemoryClass.TOOL_RESULT,
+        tool_learning=PhoenixToolLearningRecord(
+            record_kind=PhoenixToolLearningKind.TOOL_OUTCOME,
+            record_id="tool-retention-1",
+        ),
+        retention=PhoenixRetentionMetadata(
+            score=0.8,
+            state=PhoenixRetentionState.WARM,
+        ),
+    )
+    parsed_tool = parse_phoenix_metadata(tool_item.to_hindsight_metadata())
+    assert parsed_tool is not None
+    assert parsed_tool.tool_learning is not None
+    assert parsed_tool.retention is not None
+
+
+def test_protected_retention_state_requires_protected_reason_only_when_protected() -> None:
+    protected = PhoenixRetentionMetadata(
+        score=1.0,
+        state=PhoenixRetentionState.PROTECTED,
+        protected_reason="Constitutional or safety-critical memory.",
+    )
+    assert protected.state == PhoenixRetentionState.PROTECTED
+
+    try:
+        PhoenixRetentionMetadata(
+            score=0.7,
+            state=PhoenixRetentionState.WARM,
+            protected_reason="must not be silently accepted",
+        )
+    except Exception:
+        pass
+    else:
+        raise AssertionError("protected_reason must require state=protected")
+
+
+def test_recalled_protected_retention_state_is_not_downgraded() -> None:
+    metadata = PhoenixMemoryMetadata(
+        source="constitution",
+        memory_class=PhoenixMemoryClass.ARCHITECTURE_DECISION,
+        retention=PhoenixRetentionMetadata(
+            score=1.0,
+            state=PhoenixRetentionState.PROTECTED,
+            protected_reason="Constitutional memory.",
+        ),
+    ).to_hindsight_metadata()
+    metadata["pv_authority"] = "approved"
+
+    parsed = parse_phoenix_metadata(metadata)
+
+    assert parsed is not None
+    assert parsed.retention is not None
+    assert parsed.retention.state == PhoenixRetentionState.PROTECTED
+    assert parsed.retention.protected_reason == "Constitutional memory."
     assert parsed.authority == "context_only"
